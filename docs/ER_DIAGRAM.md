@@ -1,6 +1,6 @@
 # EduTrack — Entity-Relationship (ER) Diagram
 
-This document contains the visual data model for EduTrack, specifying all entities, attributes, primary keys (`PK`), foreign keys (`FK`), and relational cardinalities.
+This document contains the visual data model for EduTrack, specifying all entities, attributes, primary keys (`PK`), foreign keys (`FK`), and relational cardinalities across the normalized schema.
 
 ---
 
@@ -31,6 +31,9 @@ erDiagram
     CENTERS ||--o{ ACTIVITY_TEMPLATES : "local_templates"
     USERS ||--o{ ACTIVITY_TEMPLATES : "authored_by"
 
+    ACTIVITY_TEMPLATES ||--o{ ACTIVITY_COMPETENCIES : "targets"
+    COMPETENCIES ||--o{ ACTIVITY_COMPETENCIES : "mapped_in"
+
     ACTIVITY_TEMPLATES ||--o{ LEARNING_SESSIONS : "template_instance"
     CENTERS ||--o{ LEARNING_SESSIONS : "conducted_at"
     USERS ||--o{ LEARNING_SESSIONS : "instructor"
@@ -38,7 +41,11 @@ erDiagram
     LEARNING_SESSIONS ||--|{ SESSION_STUDENTS : "includes"
     STUDENTS ||--o{ SESSION_STUDENTS : "attends"
 
-    STUDENTS ||--o{ STUDENT_SKILL_PROGRESS : "tracks"
+    SESSION_STUDENTS ||--|{ SESSION_STUDENT_EVALUATIONS : "evaluated_on"
+    COMPETENCIES ||--o{ SESSION_STUDENT_EVALUATIONS : "rated_for"
+
+    STUDENTS ||--o{ STUDENT_SKILL_PROGRESS : "accumulates"
+    COMPETENCIES ||--o{ STUDENT_SKILL_PROGRESS : "mastery_index"
     USERS ||--o{ AUDIT_LOGS : "performed_by"
 
     USERS {
@@ -56,6 +63,7 @@ erDiagram
         string code
         string name
         string address
+        string timezone
         int capacity
         boolean is_active
         timestamptz created_at
@@ -78,6 +86,7 @@ erDiagram
         string gender
         string guardian_name
         string guardian_phone
+        string notes
         string status
         int version
         timestamptz created_at
@@ -101,6 +110,8 @@ erDiagram
         uuid reviewed_by_user_id FK
         string status
         string request_reason
+        boolean capacity_override
+        string capacity_override_reason
         date effective_date
     }
 
@@ -124,6 +135,14 @@ erDiagram
         timestamptz changed_at
     }
 
+    COMPETENCIES {
+        uuid id PK
+        string code
+        string name
+        string domain
+        string description
+    }
+
     ACTIVITY_TEMPLATES {
         uuid id PK
         uuid center_id FK
@@ -131,8 +150,15 @@ erDiagram
         string title
         string subject_area
         int duration_minutes
-        jsonb competencies
         boolean is_global
+        boolean is_active
+    }
+
+    ACTIVITY_COMPETENCIES {
+        uuid id PK
+        uuid activity_template_id FK
+        uuid competency_id FK
+        boolean is_primary
     }
 
     LEARNING_SESSIONS {
@@ -151,14 +177,22 @@ erDiagram
         uuid session_id FK
         uuid student_id FK
         string participation_status
-        string mastery_level
+        string qualitative_feedback
         numeric score
+    }
+
+    SESSION_STUDENT_EVALUATIONS {
+        uuid id PK
+        uuid session_student_id FK
+        uuid competency_id FK
+        string mastery_level
+        string teacher_notes
     }
 
     STUDENT_SKILL_PROGRESS {
         uuid id PK
         uuid student_id FK
-        string competency_key
+        uuid competency_id FK
         string current_level
         int total_sessions_count
         timestamptz last_evaluated_at
@@ -189,22 +223,31 @@ erDiagram
 | **`centers`** | `enrollment_records` | $1 : N$ | Historical enrollments remain tied to center (`RESTRICT`). |
 | **`students`** | `transfer_requests` | $1 : N$ | All transfer proposals are archived per student (`RESTRICT`). |
 | **`students`** | `attendance_records` | $1 : N$ | Student cannot be purged if attendance history exists (`RESTRICT`). |
-| **`attendance_records`** | `attendance_audit_logs` | $1 : N$ | If an attendance entry is removed, its corrections cascade (`CASCADE`). |
+| **`attendance_records`** | `attendance_audit_logs` | $1 : N$ | Audit trail is protected against deletion (`RESTRICT`). |
+| **`activity_templates`** | `activity_competencies` | $1 : N$ | Removing a template removes its competency linkages (`CASCADE`). |
+| **`competencies`** | `activity_competencies` | $1 : N$ | Competencies linked to activities cannot be hard-deleted (`RESTRICT`). |
 | **`activity_templates`** | `learning_sessions` | $1 : N$ | Templates with recorded sessions cannot be hard-deleted (`RESTRICT`). |
-| **`learning_sessions`** | `session_students` | $1 : N$ | Deleting a session instance removes student participation entries (`CASCADE`). |
+| **`learning_sessions`** | `session_students` | $1 : N$ | Deleting a session instance removes student roster entries (`CASCADE`). |
+| **`session_students`** | `session_student_evaluations` | $1 : N$ | Granular competency ratings cascade with session student entry (`CASCADE`). |
+| **`competencies`** | `session_student_evaluations` | $1 : N$ | Competency with evaluations cannot be purged (`RESTRICT`). |
 | **`students`** | `student_skill_progress`| $1 : N$ | Aggregated competency progress directly tied to student (`CASCADE`). |
+| **`competencies`** | `student_skill_progress`| $1 : N$ | Competencies referenced in progress cannot be purged (`RESTRICT`). |
 | **`users`** | `audit_logs` | $1 : N$ | Actor references preserved or set to `NULL` on deletion (`SET NULL`). |
 
 ---
 
 ## 3. Structural Constraints Summary
 
-1. **Many-to-Many Relationships Handled via Pure Junctions:**
+1. **Normalized Junctions for Many-to-Many Relationships:**
    - Users $\longleftrightarrow$ Centers: Managed by `user_centers` with `UNIQUE (user_id, center_id)`.
-   - Learning Sessions $\longleftrightarrow$ Students: Managed by `session_students` with `UNIQUE (session_id, student_id)`.
-2. **Compound Uniqueness Constraints:**
+   - Activities $\longleftrightarrow$ Competencies: Managed by `activity_competencies` with `UNIQUE (activity_template_id, competency_id)`.
+   - Sessions $\longleftrightarrow$ Students: Managed by `session_students` with `UNIQUE (session_id, student_id)`.
+   - Student Session $\longleftrightarrow$ Competencies: Managed by `session_student_evaluations` with `UNIQUE (session_student_id, competency_id)`.
+2. **Compound Uniqueness Constraints & Partial Indexes:**
+   - Single Active Enrollment: Partial unique index `uq_student_active_enrollment ON enrollment_records(student_id) WHERE status = 'ACTIVE' AND end_date IS NULL`.
    - Single Daily Attendance: `attendance_records (student_id, attendance_date) UNIQUE`.
-   - Aggregated Skill Progress: `student_skill_progress (student_id, competency_key) UNIQUE`.
+   - Aggregated Skill Progress: `student_skill_progress (student_id, competency_id) UNIQUE`.
    - Unique Center Codes: `centers (code) UNIQUE`.
    - Unique User Identities: `users (email) UNIQUE`.
    - Unique Student Registration: `students (student_id_number) UNIQUE`.
+   - Unique Competency Codes: `competencies (code) UNIQUE`.

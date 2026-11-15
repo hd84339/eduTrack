@@ -1,9 +1,10 @@
 # EduTrack — RESTful API Specification
 
-**API Version:** `v1`  
-**Base Path:** `/api/v1`  
-**Protocol:** HTTPS / JSON  
-**Authentication Scheme:** HTTP Bearer JWT  
+**API Version:** `v1`<br>
+**Base Path:** `/api/v1`<br>
+**Protocol:** HTTPS / JSON<br>
+**Authentication Scheme:** HTTP Bearer JWT<br>
+**Document Version:** 1.1.0
 
 ---
 
@@ -11,6 +12,7 @@
 
 ### 1.1 Standard Headers
 - `Authorization: Bearer <jwt_access_token>` (Required for all protected routes)
+- `X-Center-ID: <uuid>` (Optional/Context header: specifies active center context for multi-center staff)
 - `Content-Type: application/json`
 - `X-Request-ID: <uuid>` (Propagated for correlation across logs and audit trails)
 
@@ -46,7 +48,7 @@ All error responses return a standardized structured payload:
     "details": [
       {
         "field": "version",
-        "issue": "Submitted version 3 does not match current database version 4"
+        "issue": "Submitted version 1 does not match current database version 2"
       }
     ],
     "timestamp": "2026-11-15T13:30:00Z",
@@ -64,7 +66,7 @@ All error responses return a standardized structured payload:
 - `403 Forbidden`: Authenticated user lacks role or center permissions.
 - `404 Not Found`: Target resource does not exist.
 - `409 Conflict`: Business rule violation or OCC version collision.
-- `422 Unprocessable Entity`: Semantic/schema validation error.
+- `422 Unprocessable Entity`: Semantic/schema validation error (e.g., destination center at capacity).
 - `500 Internal Server Error`: Unhandled server exception.
 
 ---
@@ -133,7 +135,7 @@ Retrieves currently authenticated user profile and permissions.
 ### Module 2: Learning Center Management (`/centers`)
 
 #### `GET /centers`
-Lists all learning centers. Super Admins see all; Managers and Teachers see assigned centers.
+Lists learning centers. Super Admins see all; Managers and Teachers see assigned centers.
 - **Access:** Authenticated
 - **Query Params:** `is_active=true`, `search=North`, `page=1`, `size=20`
 - **Response (200 OK):** Paginated array of center summaries.
@@ -147,6 +149,7 @@ Creates a new learning center.
     "code": "CEN-SOUTH-02",
     "name": "South Bay Center",
     "address": "450 Ocean Ave, San Francisco, CA 94112",
+    "timezone": "America/Los_Angeles",
     "contact_phone": "+1-555-0199",
     "contact_email": "southbay@edutrack.org",
     "capacity": 120
@@ -183,6 +186,7 @@ Lists students with multi-attribute filtering and pagination.
         "current_center_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
         "center_name": "North Ridge Learning Center",
         "date_of_birth": "2018-05-14",
+        "gender": "Male",
         "status": "ACTIVE",
         "guardian_name": "Sarah Johnson",
         "guardian_phone": "+1-555-0144",
@@ -210,7 +214,7 @@ Registers a new student and atomically initializes their first `EnrollmentRecord
     "guardian_email": "david.w@example.com",
     "guardian_relationship": "Father",
     "emergency_contact": "Aunt Clara: +1-555-0189",
-    "medical_notes": "Mild peanut allergy"
+    "notes": "Prefers front-row seating"
   }
   ```
 - **Response (201 Created):** Full created student profile with `version: 1`.
@@ -230,7 +234,7 @@ Updates student profile. Requires submitting current `version`.
     "guardian_phone": "+1-555-0999",
     "guardian_email": "david.ws@example.com",
     "emergency_contact": "Aunt Clara: +1-555-0189",
-    "medical_notes": "Mild peanut allergy, carries EpiPen",
+    "notes": "Prefers front-row seating; pickup authorized by grandmother",
     "version": 1
   }
   ```
@@ -261,13 +265,15 @@ Lists pending or past transfer requests filterable by center and status.
 - **Query Params:** `status=PENDING`, `direction=incoming|outgoing`
 
 #### `POST /transfers/{id}/review`
-Approves or rejects a pending transfer request within an ACID transaction.
+Approves or rejects a pending transfer request within an ACID transaction. Supports Super Admin capacity override.
 - **Access:** `SUPER_ADMIN` or `CENTER_MANAGER` (Destination Center)
 - **Request Body:**
   ```json
   {
     "action": "APPROVE",
-    "review_notes": "Seat confirmed in Cohort B"
+    "review_notes": "Seat confirmed in Cohort B",
+    "capacity_override": false,
+    "capacity_override_reason": null
   }
   ```
 - **Response (200 OK):**
@@ -278,9 +284,11 @@ Approves or rejects a pending transfer request within an ACID transaction.
     "student_id": "3fa85f64-...",
     "new_center_id": "d290f1ee-...",
     "closed_enrollment_id": "8f7e6d5c-...",
-    "new_enrollment_id": "1a2b3c4d-..."
+    "new_enrollment_id": "1a2b3c4d-...",
+    "capacity_override": false
   }
   ```
+- **Error (422 Unprocessable Entity):** If destination center is at capacity and `capacity_override` is not authorized.
 
 ---
 
@@ -295,6 +303,9 @@ Queries daily attendance roster for a center and date.
 #### `POST /attendance/bulk`
 Submits bulk daily attendance for multiple students in a single atomic transaction.
 - **Access:** `SUPER_ADMIN`, `CENTER_MANAGER`, `TEACHER`
+- **Validation Rules:**
+  - `attendance_date` cannot be in the future (evaluated against target center's local timezone).
+  - Every student must have an active enrollment at `center_id` covering `attendance_date`.
 - **Request Body:**
   ```json
   {
@@ -314,7 +325,7 @@ Submits bulk daily attendance for multiple students in a single atomic transacti
       {
         "student_id": "9a8b7c6d-5555-4444-3333-222211110000",
         "status": "EXCUSED",
-        "remarks": "Medical appointment"
+        "remarks": "Dentist appointment"
       }
     ]
   }
@@ -331,7 +342,7 @@ Submits bulk daily attendance for multiple students in a single atomic transacti
 
 #### `PATCH /attendance/{id}`
 Corrects an existing attendance record. Enforces OCC version checking and records an entry in `attendance_audit_logs`.
-- **Access:** `TEACHER` (within 24h), `CENTER_MANAGER`, `SUPER_ADMIN`
+- **Access:** `TEACHER` (within 24 hours of record `created_at`), `CENTER_MANAGER`, `SUPER_ADMIN`
 - **Request Body:**
   ```json
   {
@@ -348,7 +359,45 @@ Fetches the immutable correction history for a specific attendance record.
 
 ---
 
-### Module 6: Learning Activity Management (`/activities/templates`)
+### Module 6: Competency Catalog (`/competencies`)
+
+#### `GET /competencies`
+Lists standardized competencies filterable by domain.
+- **Access:** Authenticated
+- **Query Params:** `domain=Mathematics`, `page=1`, `size=50`
+- **Response (200 OK):**
+  ```json
+  {
+    "items": [
+      {
+        "id": "c1a2b3c4-1111-2222-3333-444455556666",
+        "code": "MATH-FRAC-01",
+        "name": "Identifies Unit Fractions",
+        "domain": "Mathematics",
+        "description": "Ability to identify 1/2, 1/4, 1/8 using visual and physical manipulatives"
+      }
+    ],
+    "pagination": { "page": 1, "size": 50, "total_items": 1, "total_pages": 1, "has_next": false, "has_prev": false }
+  }
+  ```
+
+#### `POST /competencies`
+Creates a new standardized competency in the central catalog.
+- **Access:** `SUPER_ADMIN`
+- **Request Body:**
+  ```json
+  {
+    "code": "LIT-PHON-01",
+    "name": "Phonemic Segmentation",
+    "domain": "Literacy",
+    "description": "Segmenting three-phoneme words into individual phonemes"
+  }
+  ```
+- **Response (201 Created):** Created competency record.
+
+---
+
+### Module 7: Learning Activity Management (`/activities/templates`)
 
 #### `GET /activities/templates`
 Retrieves activity templates (Global templates + templates scoped to assigned centers).
@@ -356,7 +405,7 @@ Retrieves activity templates (Global templates + templates scoped to assigned ce
 - **Query Params:** `subject_area=Mathematics`, `is_active=true`
 
 #### `POST /activities/templates`
-Creates a new activity template.
+Creates a new activity template linked to normalized competencies.
 - **Access:** `SUPER_ADMIN`, `CENTER_MANAGER`
 - **Request Body:**
   ```json
@@ -370,19 +419,25 @@ Creates a new activity template.
     "target_age_max": 10,
     "duration_minutes": 45,
     "competencies": [
-      { "key": "MATH-FRAC-01", "name": "Identifies Unit Fractions" },
-      { "key": "MATH-FRAC-02", "name": "Compares Equivalent Fractions" }
+      {
+        "competency_id": "c1a2b3c4-1111-2222-3333-444455556666",
+        "is_primary": true
+      },
+      {
+        "competency_id": "d2b3c4d5-2222-3333-4444-555566667777",
+        "is_primary": false
+      }
     ]
   }
   ```
-- **Response (201 Created):** Template object.
+- **Response (201 Created):** Template object with nested competencies.
 
 ---
 
-### Module 7: Learning Session Management (`/sessions`)
+### Module 8: Learning Session Management (`/sessions`)
 
 #### `POST /sessions`
-Logs a conducted learning session along with participating student scorecards.
+Logs a conducted learning session along with granular multi-competency student observation scorecards.
 - **Access:** `TEACHER`, `CENTER_MANAGER`, `SUPER_ADMIN`
 - **Request Body:**
   ```json
@@ -398,14 +453,25 @@ Logs a conducted learning session along with participating student scorecards.
       {
         "student_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
         "participation_status": "COMPLETED",
-        "mastery_level": "PROFICIENT",
-        "qualitative_feedback": "Demonstrated immediate grasp of 1/2 vs 1/4 representation.",
-        "score": 90.0
+        "qualitative_feedback": "Demonstrated quick grasp of 1/2 vs 1/4 representation.",
+        "score": 90.0,
+        "evaluations": [
+          {
+            "competency_id": "c1a2b3c4-1111-2222-3333-444455556666",
+            "mastery_level": "PROFICIENT",
+            "teacher_notes": "Correctly built all fraction models independently."
+          },
+          {
+            "competency_id": "d2b3c4d5-2222-3333-4444-555566667777",
+            "mastery_level": "DEVELOPING",
+            "teacher_notes": "Required guidance when comparing 2/4 to 1/2 equivalence."
+          }
+        ]
       }
     ]
   }
   ```
-- **Response (201 Created):** Session object including nested `session_students`.
+- **Response (201 Created):** Full session object with nested students and competency evaluations.
 
 #### `GET /sessions`
 Lists learning sessions with filters (`center_id`, `date_range`, `template_id`).
@@ -413,7 +479,7 @@ Lists learning sessions with filters (`center_id`, `date_range`, `template_id`).
 
 ---
 
-### Module 8: Student Progress Tracking (`/progress`)
+### Module 9: Student Progress Tracking (`/progress`)
 
 #### `GET /progress/students/{student_id}`
 Returns aggregated competency mastery levels and timeline for a student.
@@ -424,8 +490,10 @@ Returns aggregated competency mastery levels and timeline for a student.
     "student_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
     "competencies": [
       {
-        "competency_key": "MATH-FRAC-01",
-        "competency_name": "Identifies Unit Fractions",
+        "competency_id": "c1a2b3c4-1111-2222-3333-444455556666",
+        "code": "MATH-FRAC-01",
+        "name": "Identifies Unit Fractions",
+        "domain": "Mathematics",
         "current_level": "PROFICIENT",
         "total_sessions_count": 3,
         "last_evaluated_at": "2026-11-15T10:45:00Z"
@@ -436,7 +504,7 @@ Returns aggregated competency mastery levels and timeline for a student.
 
 ---
 
-### Module 9: Dashboard & Analytics (`/analytics`)
+### Module 10: Dashboard & Analytics (`/analytics`)
 
 #### `GET /analytics/overview`
 Organization-wide summary for Super Admins.
@@ -446,11 +514,11 @@ Organization-wide summary for Super Admins.
 #### `GET /analytics/centers/{center_id}`
 Operational metrics for a specific center.
 - **Access:** `SUPER_ADMIN` or Assigned `CENTER_MANAGER`
-- **Response (200 OK):** Active student count, attendance rate (today & 30-day average), weekly completed sessions count, pending transfer requests count.
+- **Response (200 OK):** Active student count, capacity occupancy %, attendance rate (today & 30-day average), weekly completed sessions count, pending transfer requests.
 
 ---
 
-### Module 10: Reports (`/reports`)
+### Module 11: Reports (`/reports`)
 
 #### `GET /reports/attendance`
 Generates downloadable attendance reports.
@@ -464,7 +532,7 @@ Produces comprehensive student longitudinal dossier (bio, enrollment history, at
 
 ---
 
-### Module 11: User & Staff Management (`/users`)
+### Module 12: User & Staff Management (`/users`)
 
 #### `GET /users`
 Lists staff members with role and center assignment filters.
@@ -492,7 +560,7 @@ Updates center assignments for a staff member.
 
 ---
 
-### Module 12: Audit Logging (`/audit-logs`)
+### Module 13: Audit Logging (`/audit-logs`)
 
 #### `GET /audit-logs`
 Queries system-wide audit records.

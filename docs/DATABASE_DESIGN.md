@@ -1,20 +1,22 @@
 # EduTrack — Database Design & Schema Specification
 
-**Database Engine:** PostgreSQL 15+  
-**ORM / Migration:** SQLAlchemy 2.0 / Alembic  
-**Primary Key Convention:** UUIDv4 (`gen_random_uuid()` / `uuid_generate_v4()`)  
-**Naming Conventions:** Table names: `plural_snake_case`; Column names: `snake_case`  
+**Database Engine:** PostgreSQL 15+<br>
+**ORM / Migration:** SQLAlchemy 2.0 / Alembic<br>
+**Primary Key Convention:** UUIDv4 (`gen_random_uuid()` / `uuid_generate_v4()`)<br>
+**Naming Conventions:** Table names: `plural_snake_case`; Column names: `snake_case`<br>
+**Document Version:** 1.1.0
 
 ---
 
 ## 1. Schema Overview & Architecture Principles
 
 The EduTrack relational schema is designed with the following core principles:
-1. **Referential Integrity:** All relationships enforce foreign keys. Destructive cascading deletes (`CASCADE`) are disabled on operational data; foreign keys use `RESTRICT` or `SET NULL` to prevent accidental data loss.
-2. **Immutability of Historical Data:** When a student transfers, historical attendance and session records maintain pointers to the centers where they occurred.
-3. **Explicit Concurrency Control:** Concurrently editable tables (`students`, `attendance_records`) feature an integer `version` column for Optimistic Concurrency Control (OCC).
-4. **Zero-Duplicate Attendance:** A compound unique index `UNIQUE (student_id, attendance_date)` strictly prevents more than one record per student per calendar day.
-5. **Traceability:** Dedicated audit tables capture mutations, state transitions, and actor identities.
+1. **Referential Integrity & Audit Preservation:** Destructive cascading deletes (`CASCADE`) are strictly disabled on operational and audit records. Audit trails (`attendance_audit_logs`, `audit_logs`) use `ON DELETE RESTRICT` or `SET NULL` so historical records can never be accidentally purged.
+2. **Normalized Multi-Competency Model:** Competencies are modeled as first-class relational entities (`competencies`, `activity_competencies`, `session_student_evaluations`), enabling strict foreign-key integrity, multi-competency activity designs, and granular student evaluations.
+3. **Immutability of Historical Data:** When a student transfers, historical attendance and session records maintain pointers to the centers where they physically occurred.
+4. **Explicit Concurrency Control:** Concurrently editable tables (`students`, `attendance_records`) feature an integer `version` column for Optimistic Concurrency Control (OCC).
+5. **Zero-Duplicate Constraints & Clean Indexing:** Duplicate attendance is strictly prevented via `UNIQUE (student_id, attendance_date)`. Redundant duplicate indexes on unique constraint columns are explicitly eliminated to optimize write throughput and reduce storage overhead.
+6. **Timezone-Aware Date Boundary:** Date boundary checks (preventing future attendance dates) are enforced at the backend application layer using center local time, avoiding fragile database-level `CURRENT_DATE` checks.
 
 ---
 
@@ -42,7 +44,7 @@ Stores user identities, login credentials, and roles.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Unique user identifier |
 | `email` | `VARCHAR(255)` | `NOT NULL UNIQUE` | Normalized login email address |
-| `password_hash` | `VARCHAR(255)` | `NOT NULL` | Adaptive bcrypt password hash |
+| `password_hash` | `VARCHAR(255)` | `NOT NULL` | Adaptive bcrypt password hash ($\ge 12$ rounds) |
 | `full_name` | `VARCHAR(150)` | `NOT NULL` | Display name of staff member |
 | `phone_number` | `VARCHAR(30)` | `NULL` | Contact phone number |
 | `role` | `user_role` | `NOT NULL` | System role for RBAC |
@@ -51,7 +53,7 @@ Stores user identities, login credentials, and roles.
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record last updated timestamp |
 
 - **Indexes:**
-  - `idx_users_email` ON `users(email)`
+  - *(Note: `email` is indexed automatically by the `UNIQUE` constraint)*
   - `idx_users_role_status` ON `users(role, status)`
 
 ---
@@ -65,15 +67,16 @@ Stores learning center entities across the organization.
 | `code` | `VARCHAR(30)` | `NOT NULL UNIQUE` | Organization center code (e.g. `CEN-01`) |
 | `name` | `VARCHAR(150)` | `NOT NULL` | Center name (e.g. `North Ridge Center`) |
 | `address` | `TEXT` | `NOT NULL` | Physical address |
+| `timezone` | `VARCHAR(50)` | `NOT NULL DEFAULT 'UTC'` | IANA timezone (e.g. `America/Los_Angeles`)|
 | `contact_phone`| `VARCHAR(30)` | `NULL` | Official center phone |
 | `contact_email`| `VARCHAR(255)` | `NULL` | Official center email |
-| `capacity` | `INTEGER` | `NOT NULL DEFAULT 100` | Max active student capacity |
+| `capacity` | `INTEGER` | `NOT NULL DEFAULT 100 CHECK (capacity > 0)` | Max active student capacity |
 | `is_active` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Soft-activation status flag |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Center creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Center update timestamp |
 
 - **Indexes:**
-  - `idx_centers_code` ON `centers(code)`
+  - *(Note: `code` is indexed automatically by the `UNIQUE` constraint)*
   - `idx_centers_is_active` ON `centers(is_active)`
 
 ---
@@ -89,9 +92,8 @@ Maps staff (Center Managers & Teachers) to their assigned learning center(s).
 | `assigned_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Assignment timestamp |
 
 - **Constraints & Indexes:**
-  - `UNIQUE (user_id, center_id)`
-  - `idx_user_centers_user` ON `user_centers(user_id)`
-  - `idx_user_centers_center` ON `user_centers(center_id)`
+  - `UNIQUE (user_id, center_id)` *(automatically indexes `(user_id, center_id)`)*
+  - `idx_user_centers_center` ON `user_centers(center_id)` *(indexes reverse lookup by center)*
 
 ---
 
@@ -111,15 +113,15 @@ Stores current student profile information and demographics.
 | `guardian_phone`| `VARCHAR(30)` | `NOT NULL` | Guardian contact number |
 | `guardian_email`| `VARCHAR(255)` | `NULL` | Guardian contact email |
 | `guardian_relationship` | `VARCHAR(50)` | `NOT NULL DEFAULT 'Parent'` | Relationship to student |
-| `emergency_contact` | `TEXT` | `NULL` | Backup contact info |
-| `medical_notes` | `TEXT` | `NULL` | Allergies, special needs |
-| `status` | `student_status`| `NOT NULL DEFAULT 'ACTIVE'` | Current status |
-| `version` | `INTEGER` | `NOT NULL DEFAULT 1` | Optimistic Concurrency version |
+| `emergency_contact` | `TEXT` | `NULL` | Emergency contact details |
+| `notes` | `TEXT` | `NULL` | Non-sensitive administrative notes |
+| `status` | `student_status`| `NOT NULL DEFAULT 'ACTIVE'` | Current student status |
+| `version` | `INTEGER` | `NOT NULL DEFAULT 1` | Optimistic Concurrency version tag |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record update timestamp |
 
 - **Indexes:**
-  - `idx_students_student_id_number` ON `students(student_id_number)`
+  - *(Note: `student_id_number` is indexed automatically by the `UNIQUE` constraint)*
   - `idx_students_center_status` ON `students(current_center_id, status)`
   - `idx_students_name` ON `students(last_name, first_name)`
 
@@ -134,13 +136,15 @@ Historical registry of center enrollments for longitudinal tracking.
 | `student_id` | `UUID` | `NOT NULL REFERENCES students(id) ON DELETE RESTRICT` | Associated student |
 | `center_id` | `UUID` | `NOT NULL REFERENCES centers(id) ON DELETE RESTRICT` | Enrolled center |
 | `start_date` | `DATE` | `NOT NULL` | Enrollment start date |
-| `end_date` | `DATE` | `NULL` | Enrollment end date (NULL if active) |
+| `end_date` | `DATE` | `NULL` | Enrollment end date (NULL if currently active) |
 | `status` | `enrollment_status` | `NOT NULL DEFAULT 'ACTIVE'` | Enrollment status |
 | `notes` | `TEXT` | `NULL` | Administrative remarks |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record update timestamp |
 
-- **Indexes:**
+- **Constraints & Indexes:**
+  - `CHECK (end_date IS NULL OR end_date >= start_date)`
+  - **Single Active Enrollment Unique Partial Index:** `CREATE UNIQUE INDEX uq_student_active_enrollment ON enrollment_records (student_id) WHERE status = 'ACTIVE' AND end_date IS NULL;`
   - `idx_enrollment_student` ON `enrollment_records(student_id)`
   - `idx_enrollment_center_status` ON `enrollment_records(center_id, status)`
 
@@ -160,12 +164,15 @@ Manages inter-center student transfer workflow.
 | `status` | `transfer_status` | `NOT NULL DEFAULT 'PENDING'` | Request state |
 | `request_reason` | `TEXT` | `NOT NULL` | Justification for transfer |
 | `review_notes` | `TEXT` | `NULL` | Approver feedback |
+| `capacity_override` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Flag if Super Admin overrode capacity |
+| `capacity_override_reason` | `TEXT` | `NULL` | Mandatory reason if capacity was overriden |
 | `effective_date`| `DATE` | `NOT NULL` | Planned transition date |
 | `requested_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Submission timestamp |
 | `reviewed_at` | `TIMESTAMPTZ` | `NULL` | Approval/rejection timestamp |
 
 - **Check Constraints & Indexes:**
   - `CHECK (from_center_id <> to_center_id)`
+  - `CHECK (capacity_override = FALSE OR capacity_override_reason IS NOT NULL)`
   - `idx_transfers_student` ON `transfer_requests(student_id)`
   - `idx_transfers_status` ON `transfer_requests(status)`
   - `idx_transfers_from_center` ON `transfer_requests(from_center_id)`
@@ -179,45 +186,62 @@ Daily student attendance ledger.
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Attendance entry ID |
-| `student_id` | `UUID` | `NOT NULL REFERENCES students(id) ON DELETE RESTRICT` | Present/absent student |
+| `student_id` | `UUID` | `NOT NULL REFERENCES students(id) ON DELETE RESTRICT` | Enrolled student |
 | `center_id` | `UUID` | `NOT NULL REFERENCES centers(id) ON DELETE RESTRICT` | Center where marked |
 | `recorded_by_user_id`| `UUID` | `NOT NULL REFERENCES users(id) ON DELETE RESTRICT` | Teacher/staff who marked |
 | `attendance_date`| `DATE` | `NOT NULL` | Calendar date of attendance |
 | `status` | `attendance_status`| `NOT NULL` | Attendance state |
-| `remarks` | `VARCHAR(255)` | `NULL` | Optional note (e.g. sick note) |
+| `remarks` | `VARCHAR(255)` | `NULL` | Optional note |
 | `version` | `INTEGER` | `NOT NULL DEFAULT 1` | Optimistic Concurrency version |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Record update timestamp |
 
-- **Unique Constraint (Strict Duplicate Prevention):**
-  - `UNIQUE (student_id, attendance_date)`
-- **Check Constraints & Indexes:**
-  - `CHECK (attendance_date <= CURRENT_DATE)`
+- **Unique Constraint & Clean Indexes:**
+  - `UNIQUE (student_id, attendance_date)` *(automatically indexes `(student_id, attendance_date)`)*
   - `idx_attendance_center_date` ON `attendance_records(center_id, attendance_date)`
-  - `idx_attendance_student_date` ON `attendance_records(student_id, attendance_date)`
+- *Architectural Note: Date boundary checks (preventing future dates) are validated by the FastAPI service layer using center local time, avoiding database-level `CURRENT_DATE` timezone discrepancies.*
 
 ---
 
 ### 3.8 `attendance_audit_logs`
-Fine-grained change log for attendance corrections.
+Fine-grained, immutable change log for attendance corrections.
 
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Log ID |
-| `attendance_record_id`| `UUID` | `NOT NULL REFERENCES attendance_records(id) ON DELETE CASCADE`| Altered attendance row |
+| `attendance_record_id`| `UUID` | `NOT NULL REFERENCES attendance_records(id) ON DELETE RESTRICT`| Altered attendance row |
 | `changed_by_user_id` | `UUID` | `NOT NULL REFERENCES users(id) ON DELETE RESTRICT` | Staff who made correction |
 | `previous_status` | `attendance_status` | `NOT NULL` | Old attendance status |
 | `new_status` | `attendance_status` | `NOT NULL` | Corrected attendance status |
 | `reason` | `TEXT` | `NOT NULL` | Mandatory correction justification |
 | `changed_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Timestamp of correction |
 
-- **Indexes:**
+- **Constraints & Indexes:**
+  - Referential integrity `ON DELETE RESTRICT` guarantees the audit trail is never destroyed.
   - `idx_att_audit_record` ON `attendance_audit_logs(attendance_record_id)`
   - `idx_att_audit_changed_at` ON `attendance_audit_logs(changed_at)`
 
 ---
 
-### 3.9 `activity_templates`
+### 3.9 `competencies` (Normalized Competency Catalog)
+Standardized curriculum competencies and learning objectives.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Competency ID |
+| `code` | `VARCHAR(50)` | `NOT NULL UNIQUE` | Official competency code (e.g. `MATH-FRAC-01`)|
+| `name` | `VARCHAR(150)` | `NOT NULL` | Display title (e.g. `Identifies Unit Fractions`)|
+| `domain` | `VARCHAR(100)` | `NOT NULL` | Subject domain (e.g. `Mathematics`, `Literacy`)|
+| `description` | `TEXT` | `NULL` | Detailed mastery description & rubrics |
+| `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Catalog creation timestamp |
+
+- **Indexes:**
+  - *(Note: `code` is indexed automatically by the `UNIQUE` constraint)*
+  - `idx_competencies_domain` ON `competencies(domain)`
+
+---
+
+### 3.10 `activity_templates`
 Reusable curriculum activity definitions.
 
 | Column | Type | Constraints | Description |
@@ -228,10 +252,9 @@ Reusable curriculum activity definitions.
 | `title` | `VARCHAR(150)` | `NOT NULL` | Activity title |
 | `subject_area` | `VARCHAR(100)` | `NOT NULL` | E.g., Mathematics, Literacy, Science |
 | `description` | `TEXT` | `NOT NULL` | Learning objectives and instructions |
-| `target_age_min` | `INTEGER` | `NOT NULL DEFAULT 3` | Min target age |
-| `target_age_max` | `INTEGER` | `NOT NULL DEFAULT 18` | Max target age |
-| `duration_minutes` | `INTEGER` | `NOT NULL DEFAULT 45` | Standard activity duration |
-| `competencies` | `JSONB` | `NOT NULL DEFAULT '[]'::jsonb` | Targeted competencies array |
+| `target_age_min` | `INTEGER` | `NOT NULL DEFAULT 3 CHECK (target_age_min >= 0)` | Min target age |
+| `target_age_max` | `INTEGER` | `NOT NULL DEFAULT 18 CHECK (target_age_max >= target_age_min)`| Max target age |
+| `duration_minutes` | `INTEGER` | `NOT NULL DEFAULT 45 CHECK (duration_minutes >= 5)` | Standard activity duration |
 | `is_global` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Flag for org-wide availability |
 | `is_active` | `BOOLEAN` | `NOT NULL DEFAULT TRUE` | Active template status |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Creation timestamp |
@@ -243,7 +266,23 @@ Reusable curriculum activity definitions.
 
 ---
 
-### 3.10 `learning_sessions`
+### 3.11 `activity_competencies` (Junction Table)
+Normalized link associating activity templates with one or more competencies.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Junction ID |
+| `activity_template_id`| `UUID` | `NOT NULL REFERENCES activity_templates(id) ON DELETE CASCADE`| Associated activity template |
+| `competency_id` | `UUID` | `NOT NULL REFERENCES competencies(id) ON DELETE RESTRICT` | Targeted competency |
+| `is_primary` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Flag if primary target competency |
+
+- **Constraints & Indexes:**
+  - `UNIQUE (activity_template_id, competency_id)`
+  - `idx_act_comp_competency` ON `activity_competencies(competency_id)`
+
+---
+
+### 3.12 `learning_sessions`
 Conducted teaching session instances.
 
 | Column | Type | Constraints | Description |
@@ -267,8 +306,8 @@ Conducted teaching session instances.
 
 ---
 
-### 3.11 `session_students`
-Junction recording individual student participation and observations in a session.
+### 3.13 `session_students`
+Records student participation and overall feedback for a session.
 
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
@@ -276,38 +315,55 @@ Junction recording individual student participation and observations in a sessio
 | `session_id` | `UUID` | `NOT NULL REFERENCES learning_sessions(id) ON DELETE CASCADE` | Associated session |
 | `student_id` | `UUID` | `NOT NULL REFERENCES students(id) ON DELETE RESTRICT` | Participating student |
 | `participation_status`| `session_participation_status` | `NOT NULL DEFAULT 'COMPLETED'` | Completion state |
-| `mastery_level` | `mastery_level` | `NOT NULL` | Observed competency level |
-| `qualitative_feedback`| `TEXT` | `NULL` | Individual teacher feedback |
-| `score` | `NUMERIC(5,2)` | `NULL` | Numeric score (optional, 0-100) |
+| `qualitative_feedback`| `TEXT` | `NULL` | Overall student feedback |
+| `score` | `NUMERIC(5,2)` | `NULL CHECK (score IS NULL OR (score >= 0.0 AND score <= 100.0))`| Optional numeric score |
 | `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Entry timestamp |
 
 - **Constraints & Indexes:**
-  - `UNIQUE (session_id, student_id)`
+  - `UNIQUE (session_id, student_id)` *(automatically indexes `(session_id, student_id)`)*
+  - `CHECK (participation_status <> 'ABSENT' OR score IS NULL)`
   - `idx_session_students_student` ON `session_students(student_id)`
-  - `idx_session_students_session` ON `session_students(session_id)`
 
 ---
 
-### 3.12 `student_skill_progress`
+### 3.14 `session_student_evaluations`
+Granular mastery ratings per competency for each participating student in a session.
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Evaluation ID |
+| `session_student_id` | `UUID` | `NOT NULL REFERENCES session_students(id) ON DELETE CASCADE`| Participating student session row |
+| `competency_id` | `UUID` | `NOT NULL REFERENCES competencies(id) ON DELETE RESTRICT` | Evaluated competency |
+| `mastery_level` | `mastery_level` | `NOT NULL` | Observed competency level |
+| `teacher_notes` | `TEXT` | `NULL` | Competency-specific observation notes |
+| `created_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Evaluation timestamp |
+
+- **Constraints & Indexes:**
+  - `UNIQUE (session_student_id, competency_id)`
+  - `idx_evaluations_competency` ON `session_student_evaluations(competency_id)`
+
+---
+
+### 3.15 `student_skill_progress`
 Aggregated mastery index per student per competency.
 
 | Column | Type | Constraints | Description |
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | `PRIMARY KEY DEFAULT gen_random_uuid()` | Progress record ID |
 | `student_id` | `UUID` | `NOT NULL REFERENCES students(id) ON DELETE CASCADE` | Associated student |
-| `competency_key` | `VARCHAR(100)` | `NOT NULL` | Unique skill identifier (e.g. `MATH-FRAC-01`)|
+| `competency_id` | `UUID` | `NOT NULL REFERENCES competencies(id) ON DELETE RESTRICT` | Associated competency |
 | `current_level` | `mastery_level` | `NOT NULL` | Current aggregated mastery level |
-| `total_sessions_count`| `INTEGER` | `NOT NULL DEFAULT 1` | Cumulative sessions attended for skill |
+| `total_sessions_count`| `INTEGER` | `NOT NULL DEFAULT 1 CHECK (total_sessions_count > 0)` | Cumulative evaluated sessions |
 | `last_evaluated_at` | `TIMESTAMPTZ` | `NOT NULL` | Date of latest assessment |
 | `updated_at` | `TIMESTAMPTZ` | `NOT NULL DEFAULT NOW()` | Calculation update timestamp |
 
 - **Constraints & Indexes:**
-  - `UNIQUE (student_id, competency_key)`
-  - `idx_skill_progress_student` ON `student_skill_progress(student_id)`
+  - `UNIQUE (student_id, competency_id)` *(automatically indexes `(student_id, competency_id)`)*
+  - `idx_skill_progress_competency` ON `student_skill_progress(competency_id)`
 
 ---
 
-### 3.13 `audit_logs`
+### 3.16 `audit_logs`
 Global immutable security and operational audit trail.
 
 | Column | Type | Constraints | Description |
@@ -316,7 +372,7 @@ Global immutable security and operational audit trail.
 | `user_id` | `UUID` | `NULL REFERENCES users(id) ON DELETE SET NULL` | Actor user (NULL for system) |
 | `action` | `VARCHAR(50)` | `NOT NULL` | E.g. `CREATE`, `UPDATE`, `TRANSFER_APPROVE`|
 | `resource_type` | `VARCHAR(50)` | `NOT NULL` | E.g. `STUDENT`, `ATTENDANCE`, `TRANSFER` |
-| `resource_id` | `UUID` | `NOT NULL` | ID of altered target |
+| `resource_id` | `UUID` | `NOT NULL` | ID of altered target (no cascade delete)|
 | `client_ip` | `VARCHAR(45)` | `NULL` | IPv4 or IPv6 client address |
 | `old_values` | `JSONB` | `NULL` | State prior to modification |
 | `new_values` | `JSONB` | `NULL` | State after modification |
