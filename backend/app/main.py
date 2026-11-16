@@ -4,6 +4,7 @@ from fastapi import FastAPI, Depends, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from app.api.auth import router as auth_router
 from app.core.config import settings
 from app.db.session import get_db
 
@@ -16,6 +17,10 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG or settings.APP_ENV != "production" else None,
     redoc_url="/redoc" if settings.DEBUG or settings.APP_ENV != "production" else None,
 )
+
+# Mount API routers
+app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
+
 
 
 @app.get(
