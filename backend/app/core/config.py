@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/edutrack"
     API_V1_PREFIX: str = "/api/v1"
+    CORS_ORIGINS: str = "*"
 
     # JWT Authentication & Cryptographic Security
     JWT_SECRET_KEY: str = "edutrack-insecure-dev-secret-key-replace-in-production-min32chars"
@@ -22,6 +23,20 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30  # 1800 seconds per API_DESIGN.md
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     BCRYPT_ROUNDS: int = 12  # Adaptive bcrypt rounds >= 12 per DATABASE_DESIGN.md
+
+    @model_validator(mode="after")
+    def normalize_database_url(self) -> "Settings":
+        """
+        Normalize database URL for SQLAlchemy with psycopg v3 driver.
+        Render and various cloud providers often provide postgres:// or postgresql://;
+        psycopg v3 requires postgresql+psycopg://.
+        """
+        url = self.DATABASE_URL
+        if url.startswith("postgres://"):
+            self.DATABASE_URL = url.replace("postgres://", "postgresql+psycopg://", 1)
+        elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+            self.DATABASE_URL = url.replace("postgresql://", "postgresql+psycopg://", 1)
+        return self
 
     @model_validator(mode="after")
     def validate_production_security(self) -> "Settings":
@@ -35,6 +50,13 @@ class Settings(BaseSettings):
                     "JWT_SECRET_KEY must be a cryptographically secure key of at least 32 characters in production"
                 )
         return self
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse comma-separated CORS_ORIGINS string into a list."""
+        if not self.CORS_ORIGINS or self.CORS_ORIGINS.strip() == "*":
+            return ["*"]
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(
         env_file=os.getenv("ENV_FILE", ".env"),

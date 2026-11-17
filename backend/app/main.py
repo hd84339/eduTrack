@@ -33,13 +33,18 @@ app = FastAPI(
 )
 
 # CORS Middleware for React frontend integration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins = settings.cors_origins_list
+cors_kwargs: Dict[str, Any] = {
+    "allow_origins": cors_origins,
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+# If specific origins configured, also allow any Vercel deployment preview URL
+if cors_origins != ["*"]:
+    cors_kwargs["allow_origin_regex"] = r"https://.*\.vercel\.app"
+
+app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 # Mount all domain API routers under /api/v1
 app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
