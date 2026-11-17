@@ -213,6 +213,7 @@ class EnrollmentRecord(Base):
             "student_id",
             unique=True,
             postgresql_where=text("status = 'ACTIVE' AND end_date IS NULL"),
+            sqlite_where=text("status = 'ACTIVE' AND end_date IS NULL"),
         ),
         Index("idx_enrollment_student", "student_id"),
         Index("idx_enrollment_center_status", "center_id", "status"),
